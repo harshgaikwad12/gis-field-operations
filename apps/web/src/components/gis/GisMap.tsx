@@ -200,6 +200,11 @@ export function GisMap({
 
   const [localRoute, setLocalRoute] = useState<GeneratedRoute | null>(activeRoute);
 
+  const lastFittedRouteKeyRef = useRef<string | null>(null);
+  const hasFittedInitialMarkersRef = useRef<boolean>(false);
+  const prevSearchRef = useRef<string>(externalSearch || "");
+  const prevZoneRef = useRef<string>(selectedZoneFilter || "");
+
   // Sync external search prop if changed
   useEffect(() => {
     if (externalSearch !== undefined) {
@@ -671,9 +676,15 @@ export function GisMap({
         lineJoin: "round",
       }).addTo(routeGroup);
 
-      // Fit bounds to entire route smoothly
+      // Fit bounds to entire route smoothly ONLY once when the route is created or changed
       if (roadCoordinates.length > 0) {
-        map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+        const currentRouteKey = localRoute
+          ? `${localRoute.stops.map((s) => s.meter_id).join(",")}_${localRoute.stops.length}`
+          : null;
+        if (currentRouteKey && lastFittedRouteKeyRef.current !== currentRouteKey) {
+          map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
+          lastFittedRouteKeyRef.current = currentRouteKey;
+        }
       }
     }
 
@@ -788,8 +799,15 @@ export function GisMap({
       // Invalidate size in case layout rendered asynchronously
       map.invalidateSize();
 
-      // If no route active, fit bounds directly to city markers
-      if (!localRoute || localRoute.stops.length === 0) {
+      const searchChanged = prevSearchRef.current !== (effectiveSearch || "");
+      const zoneChanged = prevZoneRef.current !== (selectedZoneFilter || "");
+      if (searchChanged) prevSearchRef.current = effectiveSearch || "";
+      if (zoneChanged) prevZoneRef.current = selectedZoneFilter || "";
+
+      const shouldAutoFit = !hasFittedInitialMarkersRef.current || searchChanged || zoneChanged;
+
+      // If no route active, fit bounds directly to city markers ONLY on initial load or search/zone change
+      if ((!localRoute || localRoute.stops.length === 0) && shouldAutoFit) {
         if (bounds.length > 0) {
           if (bounds.length === 1) {
             map.setView(bounds[0], 16);
@@ -802,6 +820,7 @@ export function GisMap({
           } else {
             map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
           }
+          hasFittedInitialMarkersRef.current = true;
         } else {
           // Fallback to city center if zone is known
           const isNagpur = (selectedZoneFilter || "").toLowerCase().includes("nagpur");
@@ -810,6 +829,7 @@ export function GisMap({
           } else {
             map.setView([19.0760, 72.8777], 12);
           }
+          hasFittedInitialMarkersRef.current = true;
         }
       }
     }
@@ -848,14 +868,15 @@ export function GisMap({
     const targetsToRoute = validMeters
       .filter((m) => m.latitude != null && m.longitude != null)
       .map((m) => {
-        const c = consumerByMeter.get(m.meter_id);
+        const c = consumers.find((con) => con.meter_id === m.meter_id);
         return {
           meter_id: m.meter_id,
-          consumer_name: m.consumer_name ?? c?.consumer_name,
           consumer_id: c?.consumer_id,
+          consumer_name: c?.consumer_name || m.consumer_name || "Consumer",
+          address: c?.address || m.address || "Field Location",
+          pending_amount: c?.pending_amount || 0,
           latitude: m.latitude!,
           longitude: m.longitude!,
-          pending_amount: c?.pending_amount,
         };
       });
 
@@ -870,11 +891,14 @@ export function GisMap({
       targetsToRoute,
     );
 
+    lastFittedRouteKeyRef.current = null;
     setLocalRoute(route);
     if (onRouteGenerated) onRouteGenerated(route);
   };
 
   const handleClearRoute = () => {
+    lastFittedRouteKeyRef.current = null;
+    hasFittedInitialMarkersRef.current = false;
     setLocalRoute(null);
     if (onRouteGenerated) onRouteGenerated(null);
   };
