@@ -28,6 +28,7 @@ export interface UserGpsLocation {
   latitude: number;
   longitude: number;
   accuracy?: number;
+  heading?: number | null;
 }
 
 export interface RouteStop {
@@ -200,6 +201,11 @@ export function GisMap({
 
   const [localRoute, setLocalRoute] = useState<GeneratedRoute | null>(activeRoute);
 
+  const [mapBearing, setMapBearing] = useState<number>(0);
+  const [showRotationControls, setShowRotationControls] = useState<boolean>(false);
+  const [isCenteredOnUser, setIsCenteredOnUser] = useState<boolean>(false);
+  const [deviceHeading, setDeviceHeading] = useState<number | null>(null);
+
   const lastFittedRouteKeyRef = useRef<string | null>(null);
   const hasFittedInitialMarkersRef = useRef<boolean>(false);
   const prevSearchRef = useRef<string>(externalSearch || "");
@@ -223,6 +229,24 @@ export function GisMap({
   useEffect(() => {
     setLocalRoute(activeRoute);
   }, [activeRoute]);
+
+  // Listen to mobile device orientation for real compass heading
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.DeviceOrientationEvent) return;
+
+    const handleOrientation = (e: any) => {
+      const heading =
+        e.webkitCompassHeading ?? (e.alpha != null ? (360 - e.alpha) % 360 : null);
+      if (heading != null && !isNaN(heading)) {
+        setDeviceHeading(Math.round(heading));
+      }
+    };
+
+    window.addEventListener("deviceorientation", handleOrientation, true);
+    return () => {
+      window.removeEventListener("deviceorientation", handleOrientation, true);
+    };
+  }, []);
 
   // Phase 20: Global event listener for on-the-spot visit modal trigger from Leaflet Popups
   useEffect(() => {
@@ -349,6 +373,12 @@ export function GisMap({
       }
 
       const L = (await import("leaflet")).default;
+      try {
+        // @ts-expect-error leaflet-rotate dynamic module extension
+        await import("leaflet-rotate");
+      } catch (err) {
+        console.warn("leaflet-rotate extension fallback:", err);
+      }
       if (!isMounted) return;
 
       if (!mapInstanceRef.current && mapContainerRef.current) {
@@ -369,7 +399,7 @@ export function GisMap({
           initialZoom = 13;
         }
 
-        const map = L.map(mapContainerRef.current, {
+        const mapOptions: any = {
           center: initialCenter,
           zoom: initialZoom,
           zoomControl: false, // We render modern glassmorphic zoom buttons
@@ -383,7 +413,14 @@ export function GisMap({
           wheelPxPerZoomLevel: 90, // Ultra-smooth trackpad/mouse scroll handling
           wheelDebounceTime: 40,
           bounceAtZoomLimits: true,
-        });
+          rotate: true,
+          touchRotate: true, // Enables two-finger 360-degree rotation gesture on mobile
+          shiftKeyRotate: true,
+          rotateControl: false,
+          bearing: 0,
+        };
+
+        const map = L.map(mapContainerRef.current, mapOptions);
 
         // High-Detail Google Maps Standard Street Layer
         const streetTile = L.tileLayer(
@@ -405,6 +442,18 @@ export function GisMap({
         layerGroupRef.current = layerGroup;
         routeLayerGroupRef.current = routeLayerGroup;
         setMapLoaded(true);
+
+        // Listen for 360-degree map rotation events
+        if (typeof (map as any).on === "function") {
+          map.on("rotate", () => {
+            if (typeof (map as any).getBearing === "function") {
+              setMapBearing(Math.round((map as any).getBearing()));
+            }
+          });
+          map.on("dragstart", () => {
+            setIsCenteredOnUser(false);
+          });
+        }
 
         // Immediate size invalidation to avoid gray tiles
         setTimeout(() => {
@@ -510,18 +559,44 @@ export function GisMap({
       }
 
       if (userLocation && userLocation.latitude && userLocation.longitude) {
-        // Phase 15: Prominent Pulsing Blue Dot for Live Officer GPS
+        // Calculate heading: from prop, device sensor, or towards next route stop
+        let headingDeg = userLocation.heading ?? deviceHeading;
+        if (headingDeg == null && localRoute && localRoute.stops.length > 0) {
+          const nextStop = localRoute.stops[0];
+          const dLon = ((nextStop.longitude - userLocation.longitude) * Math.PI) / 180;
+          const y = Math.sin(dLon) * Math.cos((nextStop.latitude * Math.PI) / 180);
+          const x =
+            Math.cos((userLocation.latitude * Math.PI) / 180) *
+              Math.sin((nextStop.latitude * Math.PI) / 180) -
+            Math.sin((userLocation.latitude * Math.PI) / 180) *
+              Math.cos((nextStop.latitude * Math.PI) / 180) *
+              Math.cos(dLon);
+          headingDeg = Math.round(((Math.atan2(y, x) * 180) / Math.PI + 360) % 360);
+        }
+        if (headingDeg == null) headingDeg = 45; // Default orientation angle
+
+        // Authentic Google Maps Blue Dot with Directional Heading Flashlight Cone (Images 1 & 2)
         const gpsIcon = L.divIcon({
           className: "custom-user-gps-marker",
           html: `
-            <div style="position: relative; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;">
-              <div style="position: absolute; width: 34px; height: 34px; background-color: rgba(37, 99, 235, 0.28); border-radius: 50%; animation: ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
-              <div style="position: absolute; width: 22px; height: 22px; background-color: rgba(59, 130, 246, 0.5); border-radius: 50%;"></div>
-              <div style="position: relative; width: 14px; height: 14px; background-color: #1d4ed8; border: 2.5px solid #ffffff; border-radius: 50%; box-shadow: 0 2px 8px rgba(0,0,0,0.5);"></div>
+            <div style="position: relative; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; cursor: pointer;">
+              <!-- Google Maps Directional Heading Flashlight Beam Cone -->
+              <div style="position: absolute; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; transform: rotate(${headingDeg}deg); pointer-events: none;">
+                <div style="position: absolute; top: 1px; width: 44px; height: 32px; background: radial-gradient(ellipse at 50% 100%, rgba(26,115,232,0.48) 0%, rgba(59,130,246,0.18) 60%, rgba(59,130,246,0) 80%); clip-path: polygon(50% 100%, 0% 0%, 100% 0%); filter: drop-shadow(0 0 3px rgba(26,115,232,0.3));"></div>
+              </div>
+              <!-- Outer Live GPS Pulse Ring -->
+              <div style="position: absolute; width: 32px; height: 32px; background-color: rgba(26, 115, 232, 0.22); border-radius: 50%; animation: ping 2.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
+              <!-- Outer Light Blue Halo -->
+              <div style="position: absolute; width: 22px; height: 22px; background-color: rgba(232, 240, 254, 0.85); border-radius: 50%;"></div>
+              <!-- Solid White Ring -->
+              <div style="position: relative; width: 16px; height: 16px; background-color: #ffffff; border-radius: 50%; box-shadow: 0 2px 7px rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center;">
+                <!-- Solid Google Royal Blue Center Dot (matching Image 2) -->
+                <div style="width: 10px; height: 10px; background-color: #1a73e8; border-radius: 50%;"></div>
+              </div>
             </div>
           `,
-          iconSize: [34, 34],
-          iconAnchor: [17, 17],
+          iconSize: [64, 64],
+          iconAnchor: [32, 32],
         });
 
         const marker = L.marker([userLocation.latitude, userLocation.longitude], {
@@ -848,13 +923,41 @@ export function GisMap({
 
   const handleCenterUser = () => {
     if (userLocation && mapInstanceRef.current) {
-      mapInstanceRef.current.setView(
+      mapInstanceRef.current.flyTo(
         [userLocation.latitude, userLocation.longitude],
-        16,
+        17,
+        { animate: true, duration: 0.8 },
       );
-    } else if (onLocateUser) {
+      setIsCenteredOnUser(true);
+      // Double tap when already centered toggles orienting towards heading or North
+      if (isCenteredOnUser && typeof mapInstanceRef.current.setBearing === "function") {
+        if (mapBearing !== 0) {
+          handleSetBearing(0);
+        } else {
+          const heading = userLocation.heading ?? deviceHeading ?? 45;
+          handleSetBearing(heading);
+        }
+      }
+    }
+    if (onLocateUser) {
       onLocateUser();
     }
+  };
+
+  const handleSetBearing = (deg: number) => {
+    const normalized = ((deg % 360) + 360) % 360;
+    if (mapInstanceRef.current && typeof mapInstanceRef.current.setBearing === "function") {
+      mapInstanceRef.current.setBearing(normalized);
+    }
+    setMapBearing(Math.round(normalized));
+  };
+
+  const handleResetNorth = () => {
+    handleSetBearing(0);
+  };
+
+  const handleRotateRelative = (delta: number) => {
+    handleSetBearing(mapBearing + delta);
   };
 
   // Phase 19: Generate Route from current GPS & visible targets
@@ -1179,20 +1282,16 @@ export function GisMap({
             🎯
           </button>
 
-          {/* Center User GPS */}
+          {/* Center User GPS Button */}
           {userLocation && (
             <button
               type="button"
-              onClick={() => {
-                if (mapInstanceRef.current && userLocation) {
-                  mapInstanceRef.current.flyTo(
-                    [userLocation.latitude, userLocation.longitude],
-                    17,
-                    { animate: true, duration: 0.8 },
-                  );
-                }
-              }}
-              className="flex h-8 w-8 items-center justify-center rounded-xl border border-blue-200 bg-blue-50/95 text-xs font-bold text-blue-700 hover:bg-blue-100 transition active:bg-blue-200 shadow-sm"
+              onClick={handleCenterUser}
+              className={`flex h-8 w-8 items-center justify-center rounded-xl border text-xs font-bold transition active:bg-blue-200 shadow-sm ${
+                isCenteredOnUser
+                  ? "border-blue-500 bg-blue-600 text-white"
+                  : "border-blue-200 bg-blue-50/95 text-blue-700 hover:bg-blue-100"
+              }`}
               title="Fly to My Live GPS Location"
             >
               📍
@@ -1208,7 +1307,141 @@ export function GisMap({
           >
             {mapType === "streets" ? "🛰️" : "🗺️"}
           </button>
+
+          {/* Google Maps Compass Button (Top-Right, matching Image 1) */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                if (mapBearing !== 0) {
+                  handleResetNorth();
+                } else {
+                  setShowRotationControls((prev) => !prev);
+                }
+              }}
+              className={`flex h-8 w-8 sm:h-9 sm:w-9 items-center justify-center rounded-xl border border-slate-200/80 bg-white/95 backdrop-blur-xs text-xs font-bold text-slate-800 hover:bg-slate-100 transition active:scale-95 shadow-sm ${
+                mapBearing !== 0 ? "ring-2 ring-red-400/60" : ""
+              }`}
+              title={
+                mapBearing !== 0
+                  ? `Compass Bearing: ${mapBearing}° - Tap to reset North`
+                  : "360° Map Rotation - Tap to adjust orientation"
+              }
+            >
+              {/* Rotating Compass Needle (Red North, Silver South) */}
+              <div
+                style={{ transform: `rotate(${-mapBearing}deg)` }}
+                className="transition-transform duration-200 flex flex-col items-center justify-center h-5 w-5"
+              >
+                <svg width="10" height="18" viewBox="0 0 10 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <polygon points="5,1 9,9 5,7 1,9" fill="#ef4444" />
+                  <polygon points="5,17 9,9 5,7 1,9" fill="#94a3b8" />
+                </svg>
+              </div>
+            </button>
+
+            {/* Bearing degree badge when rotated */}
+            {mapBearing !== 0 && (
+              <span className="absolute -bottom-1 -left-1 rounded-md bg-slate-900 px-1 py-0.2 text-[8px] font-black text-white shadow-xs pointer-events-none">
+                {mapBearing}°
+              </span>
+            )}
+          </div>
         </div>
+
+        {/* 360-Degree Interactive Rotation Control Floating Drawer */}
+        {showRotationControls && (
+          <div className="absolute top-16 right-3 z-30 w-64 max-w-[90vw] rounded-2xl border border-slate-200 bg-white/95 p-3.5 shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm">🧭</span>
+                <span className="text-xs font-bold text-slate-800">360° Map Orientation</span>
+              </div>
+              <span className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] font-black text-slate-900">
+                {mapBearing}°
+              </span>
+            </div>
+
+            {/* Smooth 0° - 360° Rotation Range Slider */}
+            <div className="mt-3">
+              <div className="flex items-center justify-between text-[10px] font-semibold text-slate-400 mb-1">
+                <span>0° N</span>
+                <span>90° E</span>
+                <span>180° S</span>
+                <span>270° W</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="359"
+                value={mapBearing}
+                onChange={(e) => handleSetBearing(parseInt(e.target.value, 10))}
+                className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+              />
+            </div>
+
+            {/* Quick Angle Presets */}
+            <div className="mt-3 grid grid-cols-4 gap-1.5 text-center">
+              <button
+                type="button"
+                onClick={() => handleRotateRelative(-45)}
+                className="rounded-lg border border-slate-200 bg-slate-50 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-100 transition active:scale-95"
+              >
+                ↺ -45°
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRotateRelative(45)}
+                className="rounded-lg border border-slate-200 bg-slate-50 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-100 transition active:scale-95"
+              >
+                ↻ +45°
+              </button>
+              <button
+                type="button"
+                onClick={handleResetNorth}
+                className="rounded-lg border border-red-200 bg-red-50 py-1 text-[11px] font-bold text-red-600 hover:bg-red-100 transition active:scale-95"
+              >
+                North
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const heading = userLocation?.heading ?? deviceHeading ?? 45;
+                  handleSetBearing(heading);
+                }}
+                className="rounded-lg border border-blue-200 bg-blue-50 py-1 text-[11px] font-bold text-blue-600 hover:bg-blue-100 transition active:scale-95"
+              >
+                Ahead
+              </button>
+            </div>
+
+            <p className="mt-2 text-[10px] text-slate-400 text-center">
+              💡 Tip: Twist with 2 fingers on mobile to rotate freely!
+            </p>
+          </div>
+        )}
+
+        {/* Google Maps Authentic Blue Dot Location FAB (Bottom-Right, matching Image 2) */}
+        {userLocation && (
+          <button
+            type="button"
+            onClick={handleCenterUser}
+            className={`absolute bottom-4 right-4 z-20 flex h-12 w-12 sm:h-13 sm:w-13 items-center justify-center rounded-2xl bg-white shadow-xl border border-slate-200/80 transition-all duration-200 active:scale-90 hover:bg-slate-50 cursor-pointer ${
+              isCenteredOnUser ? "ring-2 ring-blue-500/50 shadow-blue-200/50" : ""
+            }`}
+            title="Re-center on My Location (Double-tap to align heading)"
+          >
+            {/* Concentric light blue circular halo */}
+            <div className="relative flex h-8.5 w-8.5 items-center justify-center rounded-full bg-[#e8f0fe] transition-transform duration-200">
+              {/* Animated soft ping when active */}
+              {isCenteredOnUser && (
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-25" />
+              )}
+              {/* Solid Google blue dot in center */}
+              <div className="h-3.5 w-3.5 rounded-full bg-[#1a73e8] shadow-xs" />
+            </div>
+          </button>
+        )}
 
         {validMeters.length === 0 && (
           <div className="absolute inset-0 flex items-center justify-center bg-slate-50/85 backdrop-blur-xs z-10">
